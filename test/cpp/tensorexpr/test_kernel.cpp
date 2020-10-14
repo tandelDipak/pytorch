@@ -2,6 +2,7 @@
 #include <torch/csrc/jit/frontend/code_template.h>
 #include <torch/csrc/jit/ir/ir.h>
 #include <torch/csrc/jit/ir/irparser.h>
+#include <torch/csrc/jit/tensorexpr/ir_simplifier.h>
 #include <torch/csrc/jit/tensorexpr/kernel.h>
 #include <torch/csrc/jit/tensorexpr/loopnest.h>
 #include <torch/csrc/jit/tensorexpr/tensor.h>
@@ -747,6 +748,178 @@ void testKernelSoftmax4D() {
     ASSERT_EQ(output.sizes(), ref.sizes());
     ASSERT_TRUE(at::allclose(output, ref));
   }
+}
+
+namespace {
+
+std::vector<int64_t> bufferSizes(const Placeholder& t) {
+  std::vector<int64_t> sizes;
+  sizes.reserve(t.ndim());
+  for (int i = 0; i < t.ndim(); i++) {
+    sizes.push_back(immediateAs<int64_t>(t.dim(i)));
+  }
+  return sizes;
+}
+
+Tensor* AtenBinary(
+    const std::string& name,
+    Tensor* lhs,
+    const Placeholder& rhs,
+    const std::function<ExprHandle(const ExprHandle&, const ExprHandle&)>&
+        body) {
+  return Compute(
+      name,
+      c10::fmap<DimArg>(c10::fmap<ExprHandle>(lhs->dims())),
+      [&](const std::vector<VarHandle>& axes) {
+        return body(lhs->call(axes), rhs.load(axes));
+      });
+}
+
+Tensor* AtenCat(const std::vector<Placeholder>& inputs, size_t dim) {
+  int concat_dim_size = 0;
+  for (const auto& x : inputs) {
+    concat_dim_size += immediateAs<int>(x.dim(dim));
+  }
+  std::vector<int> concat_sizes;
+  for (const auto dim : inputs.front().dims()) {
+    concat_sizes.push_back(immediateAs<int>(dim));
+  }
+  concat_sizes[dim] = concat_dim_size;
+  std::vector<DimArg> output_dims;
+  for (const auto size : concat_sizes) {
+    output_dims.emplace_back(ExprHandle(size));
+  }
+  return Compute(
+      "aten_cat", output_dims, [&](const std::vector<VarHandle>& axes) {
+        std::vector<ExprHandle> newAxes(axes.begin(), axes.end());
+        ExprHandle load = inputs[0].load(axes);
+        size_t offset = bufferSizes(inputs[0])[dim];
+        newAxes[dim] = newAxes[dim] - IntImm::make(offset);
+
+        for (size_t ii = 1; ii < inputs.size(); ++ii) {
+          load = ifThenElse(
+              CompareSelect::make(axes[dim], IntImm::make(offset), kLT),
+              load,
+              inputs[ii].load(newAxes));
+          offset += bufferSizes(inputs[ii])[dim];
+          newAxes[dim] = axes[dim] - IntImm::make(offset);
+        }
+        return load;
+      });
+}
+
+Tensor* ReplaceNanWithZero(Tensor* x) {
+  return Compute(
+      "replace_nans_with_zero",
+      c10::fmap<DimArg>(c10::fmap<ExprHandle>(x->dims())),
+      [&](const std::vector<VarHandle>& axes) {
+        return ifThenElse(
+            x->call(axes) == x->call(axes),
+            x->call(axes),
+            ExprHandle(float(0)));
+      });
+}
+
+Tensor* AtenClamp(Tensor* x, const float min_val, const float max_val) {
+  return Compute(
+      "clamp",
+      c10::fmap<DimArg>(c10::fmap<ExprHandle>(x->dims())),
+      [&](const std::vector<VarHandle>& axes) {
+        auto in = x->call(axes);
+        ExprHandle min(min_val);
+        ExprHandle max(max_val);
+        return CompareSelect::make(
+            in, min, min, CompareSelect::make(in, max, max, in, kGT), kLT);
+      });
+}
+
+} // namespace
+
+// clang-format off
+// test_tensorexpr --gtest_filter=TensorExprTest.KernelConcatAddMulReplaceNanClip
+// clang-format on
+void testKernelConcatAddMulReplaceNanClip() {
+  KernelScope kernel_scope;
+  std::vector<Placeholder> inps;
+  int b = 1;
+  int d = 10;
+  int concat_size = 0;
+  std::vector<ExprHandle> in_sizes;
+  in_sizes.emplace_back(b);
+  in_sizes.emplace_back(d);
+  std::vector<BufHandle> in_bufs;
+  for (int i = 0; i < 4; ++i) {
+    in_bufs.emplace_back("input", in_sizes, kFloat);
+    concat_size += d;
+  }
+  for (const auto& in_buf : in_bufs) {
+    inps.emplace_back(in_buf);
+  }
+  std::vector<ExprHandle> sizes;
+  sizes.emplace_back(b);
+  sizes.emplace_back(concat_size);
+  BufHandle add_in_buf("add_in", sizes, kFloat);
+  Placeholder add_in(add_in_buf);
+  BufHandle mul_in_buf("mul_in", sizes, kFloat);
+  Placeholder mul_in(mul_in_buf);
+  auto cat = AtenCat(inps, 1);
+  auto add = AtenBinary(
+      "add", cat, add_in, [](const ExprHandle& x, const ExprHandle& y) {
+        return x + y;
+      });
+  auto mul = AtenBinary(
+      "mul", add, mul_in, [](const ExprHandle& x, const ExprHandle& y) {
+        return x * y;
+      });
+  auto no_nans = ReplaceNanWithZero(mul);
+  auto clamp = AtenClamp(no_nans, -10.0, 10.0);
+  LoopNest l({clamp});
+  l.computeInline(l.getLoopBodyFor(cat));
+  l.computeInline(l.getLoopBodyFor(add));
+  l.computeInline(l.getLoopBodyFor(mul));
+  l.computeInline(l.getLoopBodyFor(no_nans));
+  l.prepareForCodegen();
+  Stmt* stmt = l.root_stmt();
+  stmt = IRSimplifier::simplify(stmt);
+  std::vector<torch::jit::tensorexpr::CodeGen::BufferArg> formal_parameters;
+  for (const auto in : inps) {
+    formal_parameters.emplace_back(in);
+  }
+  formal_parameters.emplace_back(add_in);
+  formal_parameters.emplace_back(mul_in);
+  formal_parameters.emplace_back(clamp);
+  // std::cerr << *stmt << "\n";
+  auto codegen = CreateCodeGen("llvm_codegen", stmt, formal_parameters);
+  // Call the generated kernel.
+  std::vector<at::Tensor> arg_tensors;
+  for (const auto in : inps) {
+    arg_tensors.push_back(
+        at::randn(bufferSizes(in), at::TensorOptions(at::kFloat)));
+  }
+  arg_tensors.push_back(
+      at::randn(bufferSizes(add_in), at::TensorOptions(at::kFloat)));
+  arg_tensors.push_back(
+      at::randn(bufferSizes(mul_in), at::TensorOptions(at::kFloat)));
+  arg_tensors.push_back(
+      at::randn(bufferSizes(clamp), at::TensorOptions(at::kFloat)));
+  std::vector<torch::jit::tensorexpr::CodeGen::CallArg> args;
+  for (const auto& arg_tensor : arg_tensors) {
+    args.emplace_back(arg_tensor.data_ptr());
+  }
+  codegen->call(args);
+  //  Call the reference implementation.
+  auto ref_cat = at::cat(
+      std::vector<at::Tensor>(
+          arg_tensors.begin(), arg_tensors.begin() + inps.size()),
+      1);
+  auto ref_add = ref_cat + arg_tensors[inps.size()];
+  auto ref_mul = ref_add * arg_tensors[inps.size() + 1];
+  at::index_put_(
+      ref_mul,
+      at::isnan(ref_mul),
+      at::scalar_tensor(0, at::TensorOptions(at::kFloat)));
+  auto ref_clamp = at::clamp(ref_mul, -10.0, 10.0);
+  ASSERT_TRUE(ref_clamp.allclose(arg_tensors.back()));
 }
 
 } // namespace jit
