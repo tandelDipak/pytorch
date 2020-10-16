@@ -873,11 +873,8 @@ void testKernelConcatAddMulReplaceNanClip() {
       });
   auto no_nans = ReplaceNanWithZero(mul);
   auto clamp = AtenClamp(no_nans, -10.0, 10.0);
-  LoopNest l({clamp});
-  l.computeInline(l.getLoopBodyFor(cat));
+  LoopNest l({cat, mul, no_nans, clamp});
   l.computeInline(l.getLoopBodyFor(add));
-  l.computeInline(l.getLoopBodyFor(mul));
-  l.computeInline(l.getLoopBodyFor(no_nans));
   l.prepareForCodegen();
   Stmt* stmt = l.root_stmt();
   stmt = IRSimplifier::simplify(stmt);
@@ -887,6 +884,9 @@ void testKernelConcatAddMulReplaceNanClip() {
   }
   formal_parameters.emplace_back(add_in);
   formal_parameters.emplace_back(mul_in);
+  formal_parameters.emplace_back(cat);
+  formal_parameters.emplace_back(mul);
+  formal_parameters.emplace_back(no_nans);
   formal_parameters.emplace_back(clamp);
   // std::cerr << *stmt << "\n";
   auto codegen = CreateCodeGen("llvm_codegen", stmt, formal_parameters);
@@ -901,7 +901,10 @@ void testKernelConcatAddMulReplaceNanClip() {
   arg_tensors.push_back(
       at::randn(bufferSizes(mul_in), at::TensorOptions(at::kFloat)));
   arg_tensors.push_back(
-      at::randn(bufferSizes(clamp), at::TensorOptions(at::kFloat)));
+      at::randn(bufferSizes(cat), at::TensorOptions(at::kFloat)));
+  arg_tensors.push_back(arg_tensors.back());
+  arg_tensors.push_back(arg_tensors.back());
+  arg_tensors.push_back(arg_tensors.back());
   std::vector<torch::jit::tensorexpr::CodeGen::CallArg> args;
   for (const auto& arg_tensor : arg_tensors) {
     args.emplace_back(arg_tensor.data_ptr());
