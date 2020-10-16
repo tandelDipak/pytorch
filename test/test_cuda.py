@@ -2075,6 +2075,8 @@ t2.start()
                 self.assertTrue(scaler.get_scale() == 1.0)
 
             for c, s in zip(mod_control.parameters(), mod_scaling.parameters()):
+                print("c: ", c)
+                print("s: ", s)
                 self.assertTrue(torch.allclose(c, s, atol=atol))
 
     # Compares no scaling + no autocasting against scaling + autocasting.
