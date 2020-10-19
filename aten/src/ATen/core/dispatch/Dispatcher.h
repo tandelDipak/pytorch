@@ -211,6 +211,26 @@ public:
     return dispatch_key != DispatchKey::BackendSelect;
   }
 
+  //
+  // ------------------------------------------------------------------------
+  //
+  // Assertions
+  //
+  // ------------------------------------------------------------------------
+
+  /**
+   * For testing purposes.
+   * Returns a list of all operators that were created through calls to registerImpl(),
+   * without any corresponding calls to registerDef(). This is almost certainly a bug,
+   * as the created OperatorHandle won't have any schema associated with it and users
+   * calling the op through the dispatcher won't be able to access it
+   *
+   *
+   * This function should be called after static initialization is finished, so that
+   * all registrations with the dispatcher have been finalized.
+   */
+  std::vector<OperatorHandle> findDanglingImpls() const;
+
 private:
   Dispatcher();
 
